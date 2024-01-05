@@ -83,66 +83,66 @@ func isMatchingScopes(scopesOne []string, scopesTwo string) bool {
 }
 
 // Read reads a storage token from the cache if it exists.
-func (m *Manager) Read(ctx context.Context, authParameters authority.AuthParams, account shared.Account) (TokenResponse, error) {
-	homeAccountID := authParameters.HomeaccountID
+func (m *Manager) Read(ctx context.Context, authParameters authority.AuthParams) (TokenResponse, error) {
+	tr := TokenResponse{}
+	homeAccountID := authParameters.HomeAccountID
 	realm := authParameters.AuthorityInfo.Tenant
 	clientID := authParameters.ClientID
 	scopes := authParameters.Scopes
+	authnSchemeKeyID := authParameters.AuthnScheme.KeyID()
+	tokenType := authParameters.AuthnScheme.AccessTokenType()
 
-	metadata, err := m.getMetadataEntry(ctx, authParameters.AuthorityInfo)
-	if err != nil {
-		return TokenResponse{}, err
-	}
-
-	accessToken := m.readAccessToken(homeAccountID, metadata.Aliases, realm, clientID, scopes)
-
-	if account.IsZero() {
-		return TokenResponse{
-			AccessToken:  accessToken,
-			RefreshToken: accesstokens.RefreshToken{},
-			IDToken:      IDToken{},
-			Account:      shared.Account{},
-		}, nil
-	}
-	idToken, err := m.readIDToken(homeAccountID, metadata.Aliases, realm, clientID)
-	if err != nil {
-		return TokenResponse{}, err
+	// fetch metadata if instanceDiscovery is enabled
+	aliases := []string{authParameters.AuthorityInfo.Host}
+	if !authParameters.AuthorityInfo.InstanceDiscoveryDisabled {
+		metadata, err := m.getMetadataEntry(ctx, authParameters.AuthorityInfo)
+		if err != nil {
+			return TokenResponse{}, err
+		}
+		aliases = metadata.Aliases
 	}
 
-	AppMetaData, err := m.readAppMetaData(metadata.Aliases, clientID)
-	if err != nil {
-		return TokenResponse{}, err
-	}
-	familyID := AppMetaData.FamilyID
+	accessToken := m.readAccessToken(homeAccountID, aliases, realm, clientID, scopes, tokenType, authnSchemeKeyID)
+	tr.AccessToken = accessToken
 
-	refreshToken, err := m.readRefreshToken(homeAccountID, metadata.Aliases, familyID, clientID)
-	if err != nil {
-		return TokenResponse{}, err
+	if homeAccountID == "" {
+		// caller didn't specify a user, so there's no reason to search for an ID or refresh token
+		return tr, nil
 	}
-	account, err = m.readAccount(homeAccountID, metadata.Aliases, realm)
-	if err != nil {
-		return TokenResponse{}, err
+	// errors returned by read* methods indicate a cache miss and are therefore non-fatal. We continue populating
+	// TokenResponse fields so that e.g. lack of an ID token doesn't prevent the caller from receiving a refresh token.
+	idToken, err := m.readIDToken(homeAccountID, aliases, realm, clientID)
+	if err == nil {
+		tr.IDToken = idToken
 	}
-	return TokenResponse{
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		IDToken:      idToken,
-		Account:      account,
-	}, nil
+
+	if appMetadata, err := m.readAppMetaData(aliases, clientID); err == nil {
+		// we need the family ID to identify the correct refresh token, if any
+		familyID := appMetadata.FamilyID
+		refreshToken, err := m.readRefreshToken(homeAccountID, aliases, familyID, clientID)
+		if err == nil {
+			tr.RefreshToken = refreshToken
+		}
+	}
+
+	account, err := m.readAccount(homeAccountID, aliases, realm)
+	if err == nil {
+		tr.Account = account
+	}
+	return tr, nil
 }
 
 const scopeSeparator = " "
 
 // Write writes a token response to the cache and returns the account information the token is stored with.
 func (m *Manager) Write(authParameters authority.AuthParams, tokenResponse accesstokens.TokenResponse) (shared.Account, error) {
-	authParameters.HomeaccountID = tokenResponse.ClientInfo.HomeAccountID()
-	homeAccountID := authParameters.HomeaccountID
+	homeAccountID := tokenResponse.HomeAccountID()
 	environment := authParameters.AuthorityInfo.Host
 	realm := authParameters.AuthorityInfo.Tenant
 	clientID := authParameters.ClientID
 	target := strings.Join(tokenResponse.GrantedScopes.Slice, scopeSeparator)
-
 	cachedAt := time.Now()
+	authnSchemeKeyID := authParameters.AuthnScheme.KeyID()
 
 	var account shared.Account
 
@@ -164,6 +164,8 @@ func (m *Manager) Write(authParameters authority.AuthParams, tokenResponse acces
 			tokenResponse.ExtExpiresOn.T,
 			target,
 			tokenResponse.AccessToken,
+			tokenResponse.TokenType,
+			authnSchemeKeyID,
 		)
 
 		// Since we have a valid access token, cache it before moving on.
@@ -184,13 +186,18 @@ func (m *Manager) Write(authParameters authority.AuthParams, tokenResponse acces
 		localAccountID := idTokenJwt.LocalAccountID()
 		authorityType := authParameters.AuthorityInfo.AuthorityType
 
+		preferredUsername := idTokenJwt.UPN
+		if idTokenJwt.PreferredUsername != "" {
+			preferredUsername = idTokenJwt.PreferredUsername
+		}
+
 		account = shared.NewAccount(
 			homeAccountID,
 			environment,
 			realm,
 			localAccountID,
 			authorityType,
-			idTokenJwt.PreferredUsername,
+			preferredUsername,
 		)
 		if err := m.writeAccount(account); err != nil {
 			return shared.Account{}, err
@@ -246,7 +253,7 @@ func (m *Manager) aadMetadata(ctx context.Context, authorityInfo authority.Info)
 	return m.aadCache[authorityInfo.Host], nil
 }
 
-func (m *Manager) readAccessToken(homeID string, envAliases []string, realm, clientID string, scopes []string) AccessToken {
+func (m *Manager) readAccessToken(homeID string, envAliases []string, realm, clientID string, scopes []string, tokenType, authnSchemeKeyID string) AccessToken {
 	m.contractMu.RLock()
 	defer m.contractMu.RUnlock()
 	// TODO: linear search (over a map no less) is slow for a large number (thousands) of tokens.
@@ -254,9 +261,11 @@ func (m *Manager) readAccessToken(homeID string, envAliases []string, realm, cli
 	// an issue, however if it does become a problem then we know where to look.
 	for _, at := range m.contract.AccessTokens {
 		if at.HomeAccountID == homeID && at.Realm == realm && at.ClientID == clientID {
-			if checkAlias(at.Environment, envAliases) {
-				if isMatchingScopes(scopes, at.Scopes) {
-					return at
+			if (at.TokenType == tokenType && at.AuthnSchemeKeyID == authnSchemeKeyID) || (at.TokenType == "" && (tokenType == "" || tokenType == "Bearer")) {
+				if checkAlias(at.Environment, envAliases) {
+					if isMatchingScopes(scopes, at.Scopes) {
+						return at
+					}
 				}
 			}
 		}
@@ -491,6 +500,8 @@ func (m *Manager) update(cache *Contract) {
 
 // Marshal implements cache.Marshaler.
 func (m *Manager) Marshal() ([]byte, error) {
+	m.contractMu.RLock()
+	defer m.contractMu.RUnlock()
 	return json.Marshal(m.contract)
 }
 

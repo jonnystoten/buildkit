@@ -14,7 +14,10 @@ import (
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/platforms"
+	signattestation "github.com/docker/image-signer-verifier/pkg/attestation"
+	"github.com/docker/image-signer-verifier/pkg/signing"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
+	v02 "github.com/in-toto/in-toto-golang/in_toto/slsa_provenance/v0.2"
 	"github.com/moby/buildkit/cache"
 	cacheconfig "github.com/moby/buildkit/cache/config"
 	"github.com/moby/buildkit/exporter"
@@ -492,17 +495,32 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 		configType = images.MediaTypeDockerSchema2Config
 	}
 
+	signer, err := signing.GetAWSSigner(ctx, "arn:aws:kms:us-east-1:175142243308:key/2400e9f0-dcb7-4675-8754-f69c6252cb10", "us-east-1")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get AWS signer")
+	}
+
 	layers := make([]ocispecs.Descriptor, len(statements))
 	for i, statement := range statements {
 		i, statement := i, statement
 
-		data, err := json.Marshal(statement)
+		mediaType, err := dsseMediaType(statement.PredicateType)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to get DSSE media type")
+		}
+
+		env, err := signattestation.SignInTotoStatement(ctx, statement, signer)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to sign in-toto statement")
+		}
+
+		data, err := json.Marshal(env)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to marshal attestation")
 		}
 		digest := digest.FromBytes(data)
 		desc := ocispecs.Descriptor{
-			MediaType: intoto.PayloadType,
+			MediaType: mediaType,
 			Digest:    digest,
 			Size:      int64(len(data)),
 			Annotations: map[string]string{
@@ -578,6 +596,20 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 			attestationTypes.DockerAnnotationReferenceDigest: target,
 		},
 	}, nil
+}
+
+func dsseMediaType(predicateType string) (string, error) {
+	var predicateName string
+	switch predicateType {
+	case v02.PredicateSLSAProvenance:
+		predicateName = "provenance"
+	case intoto.PredicateSPDX:
+		predicateName = "spdx"
+	default:
+		return "", errors.Errorf("unknown predicate type %q", predicateType)
+	}
+
+	return fmt.Sprintf("application/vnd.in-toto.%s+dsse", predicateName), nil
 }
 
 func (ic *ImageWriter) ContentStore() content.Store {
