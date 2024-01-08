@@ -495,7 +495,7 @@ func (ic *ImageWriter) commitAttestationsManifest(ctx context.Context, opts *Ima
 		configType = images.MediaTypeDockerSchema2Config
 	}
 
-	signer, err := signing.GetAWSSigner(ctx, "arn:aws:kms:us-east-1:175142243308:key/2400e9f0-dcb7-4675-8754-f69c6252cb10", "us-east-1")
+	signer, err := signing.GetAWSSigner(ctx, "awskms:///arn:aws:kms:us-east-1:175142243308:key/2400e9f0-dcb7-4675-8754-f69c6252cb10", "us-east-1")
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get AWS signer")
 	}
